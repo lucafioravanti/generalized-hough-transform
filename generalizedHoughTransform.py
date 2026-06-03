@@ -1,28 +1,38 @@
 import argparse
+import os
+import sys
 import cv2
 import numpy as np
 import matplotlib.pyplot as plt
 
 
-def buildingReferenceTable(template_gray, template_edges):
+def _quantize_angle(deg, bin_size):
+    """Quantize an angle in degrees to the nearest bin and wrap to [0, 360)."""
+    return (int(np.round(deg / bin_size)) * bin_size) % 360
+
+
+def buildingReferenceTable(template_gray, template_edges, theta_bin=1):
     """
     Build the R-Table (Reference Table) for the Generalized Hough Transform.
 
     This function calculates continuous gradients on the grayscale template to obtain
     accurate edge orientations, while restricting the reference point calculations
-    exclusively to the spatial coordinates defined by the binary edge map. For each 
-    edge pixel, it computes the spatial vector (radial distance 'r' and angle 'alpha') 
+    exclusively to the spatial coordinates defined by the binary edge map. For each
+    edge pixel, it computes the spatial vector (radial distance 'r' and angle 'alpha')
     relative to the template's centroid and indexes it by its quantized gradient orientation.
 
     Parameters:
     template_gray (numpy.ndarray): The grayscale template image used for continuous gradient calculation.
     template_edges (numpy.ndarray): The binary edge map (e.g., Canny output) used as a spatial mask.
+    theta_bin (int): Angular bin size in degrees for quantizing gradient orientations.
+                     A value of 1 reproduces the original per-degree behavior; larger
+                     values (e.g. 5) add tolerance and improve robustness to noise.
 
     Returns:
     dict: The Reference Table mapping quantized gradient orientations (0-359 degrees)
           to a list of (r, alpha) tuples pointing to the template's centroid.
     """
-    
+
     # Convertiamo in scala di grigi se non lo è già
     if len(template_gray.shape) == 3:
         template_gray = cv2.cvtColor(template_gray, cv2.COLOR_BGR2GRAY)
@@ -30,24 +40,31 @@ def buildingReferenceTable(template_gray, template_edges):
     Ix, Iy = sobel_filter(template_gray)
     G, theta = gradient_intensity(Ix, Iy)
 
-    # Define the center point of the template
-    xc, yc = template_gray.shape[0] // 2, template_gray.shape[1] // 2
+    edge_pixels = np.argwhere(template_edges > 0)
+
+    # FIX: il punto di riferimento è il BARICENTRO dei pixel di bordo (come dichiarato
+    # nel README), non il centro geometrico dell'immagine. Fallback al centro geometrico
+    # se per qualche motivo non ci sono bordi.
+    if len(edge_pixels) > 0:
+        xc = int(np.round(edge_pixels[:, 0].mean()))
+        yc = int(np.round(edge_pixels[:, 1].mean()))
+    else:
+        xc, yc = template_gray.shape[0] // 2, template_gray.shape[1] // 2
 
     # Initialize the reference table
     reference_table = {}
-    edge_pixels = np.argwhere(template_edges > 0)
     for x, y in edge_pixels:
         r = np.sqrt((xc - x)**2 + (yc - y)**2)
         alpha = np.arctan2(yc - y, xc - x)
 
-        orientation = int(np.round(np.degrees(theta[x, y]))) % 360
+        orientation = _quantize_angle(np.degrees(theta[x, y]), theta_bin)
         if orientation not in reference_table:
             reference_table[orientation] = []
         reference_table[orientation].append((r, alpha))
     return reference_table
 
 
-def calculate_accumulator(image_gray, image_edges, reference_table, scales=[1.0], rotations=[0.0]):
+def calculate_accumulator(image_gray, image_edges, reference_table, scales=[1.0], rotations=[0.0], theta_bin=1):
     """
     Calculate the accumulator array for the given image and reference table.
 
@@ -57,6 +74,7 @@ def calculate_accumulator(image_gray, image_edges, reference_table, scales=[1.0]
     reference_table (dict): The reference table.
     scales (list): List of scale factors.
     rotations (list): List of rotation angles in degrees.
+    theta_bin (int): Angular bin size in degrees (must match the value used to build the R-Table).
 
     Returns:
     numpy.ndarray: The accumulator array.
@@ -64,7 +82,9 @@ def calculate_accumulator(image_gray, image_edges, reference_table, scales=[1.0]
     Ix, Iy = sobel_filter(image_gray)
     G, theta = gradient_intensity(Ix, Iy)
 
-    is_2d = scales == [1.0] and rotations == [0.0]
+    # FIX: controllo robusto del caso 2D (non dipende dall'identità esatta delle liste).
+    is_2d = (len(scales) == 1 and len(rotations) == 1
+             and scales[0] == 1.0 and rotations[0] == 0.0)
 
     # Initialize the accumulator array
     if is_2d:
@@ -75,8 +95,9 @@ def calculate_accumulator(image_gray, image_edges, reference_table, scales=[1.0]
     # Get the indices of the edge pixels
     edge_pixels = np.argwhere(image_edges > 0)
 
-    # Get the orientation for all edge pixels, quantized to integer degrees
-    orientations = np.round(np.degrees(theta[edge_pixels[:, 0], edge_pixels[:, 1]])).astype(int) % 360
+    # Get the orientation for all edge pixels, quantized to the chosen angular bin
+    deg = np.degrees(theta[edge_pixels[:, 0], edge_pixels[:, 1]])
+    orientations = (np.round(deg / theta_bin).astype(int) * theta_bin) % 360
     unique_orientations = np.unique(orientations)
 
     scales_ary = np.array(scales)
@@ -91,8 +112,8 @@ def calculate_accumulator(image_gray, image_edges, reference_table, scales=[1.0]
         r_idx_list = []
 
         for r_idx, phi_deg in enumerate(rotations):
-            # Calculate the expected template orientation
-            o_tpl = int((o - phi_deg) % 360)
+            # Calculate the expected template orientation (snapped to the angular bin)
+            o_tpl = (int(np.round((o - phi_deg) / theta_bin)) * theta_bin) % 360
             if o_tpl in reference_table:
                 r_alpha = np.array(reference_table[o_tpl])
                 r = r_alpha[:, 0]
@@ -268,12 +289,15 @@ def gradient_intensity(Ix, Iy):
     tuple: The gradient intensity and the orientation.
     """
     G = np.hypot(Ix, Iy)
-    G = G / G.max() * 255
+    # FIX: evita la divisione per zero su immagini uniformi (G.max() == 0).
+    gmax = G.max()
+    if gmax > 0:
+        G = G / gmax * 255
     theta = np.arctan2(Iy, Ix)
     return (G, theta)
 
 
-def plotBestMatches(image, template, accumulator, matched_centers, best_match):
+def plotBestMatches(image, template, accumulator, matched_centers, best_match, output_path='output/output.png'):
     """
     Plot the original image, template, accumulator, and matched locations.
 
@@ -283,6 +307,7 @@ def plotBestMatches(image, template, accumulator, matched_centers, best_match):
     accumulator (numpy.ndarray): The accumulator array.
     matched_centers (list): The matched centers.
     best_match (tuple): The best matched center.
+    output_path (str): Where to save the resulting figure.
     """
     fig, ax = plt.subplots(2, 2, figsize=(10, 10))
 
@@ -307,10 +332,22 @@ def plotBestMatches(image, template, accumulator, matched_centers, best_match):
     title = f'Matched Locations\nBest: scale={best_match[2]}, rot={best_match[3]}°' if len(best_match) >= 4 else 'Matched Locations'
     ax[1, 1].set_title(title)
 
-    # Save the plot
-    plt.savefig('output/output.png')
+    # FIX: crea la cartella di output se non esiste.
+    os.makedirs(os.path.dirname(output_path) or '.', exist_ok=True)
+    plt.savefig(output_path)
 
-    plt.show()
+    # FIX: chiama plt.show() solo se il backend è interattivo (evita errori in headless).
+    if matplotlib_is_interactive():
+        plt.show()
+    plt.close(fig)
+
+
+def matplotlib_is_interactive():
+    """Return True if the current matplotlib backend supports an interactive display."""
+    import matplotlib
+    backend = matplotlib.get_backend().lower()
+    non_interactive = ('agg', 'pdf', 'ps', 'svg', 'cairo', 'template')
+    return not any(backend.startswith(b) for b in non_interactive)
 
 
 if __name__ == "__main__":
@@ -323,13 +360,62 @@ if __name__ == "__main__":
     parser.add_argument('--threshold_ratio', type=float, default=0.8, help='The threshold ratio for finding all matches')
     parser.add_argument('--scales', type=float, nargs='+', default=[1.0], help='List of scales to use (default: 1.0)')
     parser.add_argument('--rotations', type=float, nargs='+', default=[0.0], help='List of rotations in degrees to use (default: 0.0)')
-    
-    # NUOVI PARAMETRI: Soglie per Canny Edge Detector
+
+    # Soglie per Canny Edge Detector
     parser.add_argument('--canny_low', type=int, default=100, help='Low threshold for Canny edge detector (default: 100)')
     parser.add_argument('--canny_high', type=int, default=200, help='High threshold for Canny edge detector (default: 200)')
 
+    # NUOVO: tolleranza angolare per il matching degli orientamenti
+    parser.add_argument('--theta_bin', type=int, default=1,
+                        help='Angular bin size in degrees for orientation matching. '
+                             '1 = original per-degree behavior; larger (e.g. 5) adds robustness (default: 1)')
+
+    # NUOVO: sintassi a range (START STOP STEP) per generare automaticamente la lista
+    # di scale o rotazioni. Pratico quando servono griglie fitte (es. tutto il giro
+    # con passo 5°). La semantica e' np.arange: STOP escluso, come Python.
+    # Se passato, ha precedenza sulla lista esplicita corrispondente.
+    parser.add_argument('--rotations_range', type=float, nargs=3,
+                        metavar=('START', 'STOP', 'STEP'), default=None,
+                        help='Generate rotations as np.arange(START, STOP, STEP). '
+                             'STOP is exclusive (e.g. 0 360 5 -> 0,5,...,355). '
+                             'If provided, overrides --rotations.')
+    parser.add_argument('--scales_range', type=float, nargs=3,
+                        metavar=('START', 'STOP', 'STEP'), default=None,
+                        help='Generate scales as np.arange(START, STOP, STEP). '
+                             'STOP is exclusive (e.g. 0.8 1.3 0.1 -> 0.8,0.9,1.0,1.1,1.2). '
+                             'If provided, overrides --scales.')
+
     # Parse the arguments
     args = parser.parse_args()
+
+    # NUOVO: se sono stati forniti i range, li espando in liste con np.arange.
+    # I valori prodotti hanno precedenza sulle liste esplicite (--rotations / --scales).
+    if args.rotations_range is not None:
+        start, stop, step = args.rotations_range
+        if step == 0:
+            sys.exit("Errore: --rotations_range richiede STEP diverso da 0.")
+        if (stop - start) * step <= 0:
+            sys.exit(f"Errore: --rotations_range incoerente (START={start}, STOP={stop}, STEP={step}). "
+                     f"STEP deve avere lo stesso segno di STOP-START.")
+        rotations = np.arange(start, stop, step).tolist()
+    else:
+        rotations = args.rotations
+
+    if args.scales_range is not None:
+        start, stop, step = args.scales_range
+        if step == 0:
+            sys.exit("Errore: --scales_range richiede STEP diverso da 0.")
+        if (stop - start) * step <= 0:
+            sys.exit(f"Errore: --scales_range incoerente (START={start}, STOP={stop}, STEP={step}). "
+                     f"STEP deve avere lo stesso segno di STOP-START.")
+        scales = np.arange(start, stop, step).tolist()
+    else:
+        scales = args.scales
+
+    # Echo riassuntivo: utile in demo per vedere la dimensione effettiva dello spazio di ricerca.
+    if len(scales) > 1 or len(rotations) > 1:
+        print(f"Spazio di ricerca: {len(scales)} scale x {len(rotations)} rotazioni "
+              f"= {len(scales) * len(rotations)} combinazioni.")
 
     mainImageName = args.mainImageName
     referenceImageName = args.referenceImageName
@@ -337,24 +423,32 @@ if __name__ == "__main__":
     referenceImage = cv2.imread(referenceImageName)
     mainImage = cv2.imread(mainImageName)
 
-    # Converting the RGB image to a grayscale image.
-    referenceImage = cv2.cvtColor(referenceImage, cv2.COLOR_RGB2GRAY)
-    mainImage = cv2.cvtColor(mainImage, cv2.COLOR_RGB2GRAY)
+    # FIX: controllo esplicito sul caricamento delle immagini con messaggi chiari.
+    if referenceImage is None:
+        sys.exit(f"Errore: impossibile leggere l'immagine di riferimento '{referenceImageName}'. "
+                 f"Verifica il percorso e il formato del file.")
+    if mainImage is None:
+        sys.exit(f"Errore: impossibile leggere l'immagine principale '{mainImageName}'. "
+                 f"Verifica il percorso e il formato del file.")
+
+    # FIX: cv2.imread restituisce immagini in BGR, quindi la conversione corretta è BGR2GRAY.
+    referenceImage = cv2.cvtColor(referenceImage, cv2.COLOR_BGR2GRAY)
+    mainImage = cv2.cvtColor(mainImage, cv2.COLOR_BGR2GRAY)
 
     # Perform edge detection on the images using CLI parameters
     template = cv2.Canny(referenceImage, args.canny_low, args.canny_high)
     image = cv2.Canny(mainImage, args.canny_low, args.canny_high)
 
-    reference_table = buildingReferenceTable(referenceImage, template)
+    reference_table = buildingReferenceTable(referenceImage, template, theta_bin=args.theta_bin)
 
     # Calculate the accumulator array
-    accumulator = calculate_accumulator(mainImage, image, reference_table, args.scales, args.rotations)
+    accumulator = calculate_accumulator(mainImage, image, reference_table, scales, rotations, theta_bin=args.theta_bin)
 
     # Find the best matched location
-    best_matched_center = find_best_match(accumulator, args.scales, args.rotations)
+    best_matched_center = find_best_match(accumulator, scales, rotations)
 
     # Find all matched locations
-    matched_centers = find_all_matches(accumulator, args.threshold_ratio, args.scales, args.rotations)
+    matched_centers = find_all_matches(accumulator, args.threshold_ratio, scales, rotations)
     print(f"Trovati {len(matched_centers)} match!")
 
     # Plot the results

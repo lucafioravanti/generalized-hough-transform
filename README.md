@@ -40,15 +40,12 @@ To run this project, the following Python libraries are required:
 
 The script is executed via the command line.
 
-**Note on Headless Environments:** If you are running the script on a server or headless environment without a display, ensure you set the matplotlib backend to Agg before executing:
+**Note on Headless Environments:** The script detects non-interactive matplotlib backends (e.g. `Agg`) automatically and simply skips the on-screen display while still saving the output figure. If you want to force a headless backend, you can still set it explicitly:
 ```bash
 export MPLBACKEND=Agg
 ```
 
-**Output Directory:** The script saves the resulting plot to an `output/` directory. Ensure this directory exists before running the script:
-```bash
-mkdir -p output
-```
+**Output Directory:** The script automatically creates the `output/` directory if it does not exist, so no manual setup is required.
 
 ### Syntax
 ```bash
@@ -65,13 +62,13 @@ python3 generalizedHoughTransform.py <mainImageName> <referenceImageName> [OPTIO
 * `--rotations` : List of floats (default: `[0.0]`). Rotation angles in degrees to test. Example: `--rotations 0 90 180 270`
 * `--canny_low` : Integer (default: `100`). Low threshold for the Canny edge detector.
 * `--canny_high` : Integer (default: `200`). High threshold for the Canny edge detector.
+* `--theta_bin` : Integer (default: `1`). Angular bin size in degrees used to match gradient orientations between the template and the target. A value of `1` keeps the original per-degree behavior; larger values (e.g. `5`) add angular tolerance and improve robustness to noise and to shapes that are not pixel-identical to the template.
+* `--rotations_range` : Three floats `START STOP STEP` (no default). Convenience syntax to generate the list of rotations as `np.arange(START, STOP, STEP)`. `STOP` is exclusive, so `--rotations_range 0 360 5` produces `0, 5, 10, ..., 355`. If provided, this option takes precedence over `--rotations`.
+* `--scales_range` : Three floats `START STOP STEP` (no default). Convenience syntax to generate the list of scales as `np.arange(START, STOP, STEP)`. `STOP` is exclusive, so `--scales_range 0.8 1.3 0.1` produces `0.8, 0.9, 1.0, 1.1, 1.2`. If provided, this option takes precedence over `--scales`.
 
 ## Example
 
 ```bash
-# Ensure the output directory exists
-mkdir -p output
-
 # Run the script searching for 'template.png' inside 'image.png',
 # checking scales 0.8, 1.0, 1.2 and rotations 0, 90, 180, 270 degrees.
 python3 generalizedHoughTransform.py image.png template.png \
@@ -81,4 +78,12 @@ python3 generalizedHoughTransform.py image.png template.png \
   --canny_high 150
 ```
 
-*Expected Behavior:* The script will process the images, build the R-Table, and calculate votes across the specified 3D space (X, Y, Scale, Rotation). It will output the number of matches found to the console and save a visual plot of the original image, template, accumulator heat map, and the matched locations to `output/output.png`.
+Or, equivalently, using the range syntax — convenient when many values are needed (e.g. a full 360° rotation sweep at 5° steps):
+
+```bash
+python3 generalizedHoughTransform.py image.png template.png \
+  --scales_range 0.8 1.3 0.1 \
+  --rotations_range 0 360 5
+```
+
+*Expected Behavior:* The script will process the images, build the R-Table, and calculate votes across the specified 4D space (X, Y, Scale, Rotation). It will output the number of matches found to the console (and, when more than one scale or rotation is tested, a one-line summary of the search-space size) and save a visual plot of the original image, template, accumulator heat map, and the matched locations to `output/output.png`.
